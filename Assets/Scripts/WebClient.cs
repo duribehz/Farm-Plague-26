@@ -44,6 +44,22 @@ public sealed class WebClient : MonoBehaviour
         StartCoroutine(GetSimulation());
     }
 
+    public void ResetToStart()
+    {
+        StopAllCoroutines();
+        requestStarted = false;
+        if (statusText != null)
+        {
+            statusText.fontSize = originalFontSize;
+            statusText.text = "START";
+        }
+        if (startButton != null)
+        {
+            startButton.gameObject.SetActive(true);
+            startButton.interactable = true;
+        }
+    }
+
     private IEnumerator GetSimulation()
     {
         float loadingStartedAt = Time.realtimeSinceStartup;

@@ -13,6 +13,9 @@ public sealed class GameManager : MonoBehaviour
     [SerializeField] private GameObject fakePrefab;
     [SerializeField] private GameObject smokePrefab;
     [SerializeField] private GameObject firePrefab;
+    [SerializeField] private AgentHud agentHud;
+    [SerializeField] private SimulationControls simulationControls;
+    [SerializeField] private AnimalWanderController animalWander;
 
     [Header("Playback")]
     [SerializeField, Min(0.05f)] private float moveDuration = 0.8f;
@@ -37,6 +40,8 @@ public sealed class GameManager : MonoBehaviour
     private void Start()
     {
         CacheTiles();
+        agentHud?.SetVisible(false);
+        simulationControls?.SetVisible(false);
     }
 
     public bool PlayJson(string json)
@@ -62,11 +67,22 @@ public sealed class GameManager : MonoBehaviour
 
         InitializeSimulation();
         playback = StartCoroutine(PlaybackRoutine());
+        simulationControls?.SetVisible(true);
+        animalWander?.StartWalking();
         return true;
     }
 
-    public void Pause() => paused = true;
-    public void Resume() => paused = false;
+    public void Pause()
+    {
+        paused = true;
+        animalWander?.SetPaused(true);
+    }
+
+    public void Resume()
+    {
+        paused = false;
+        animalWander?.SetPaused(false);
+    }
 
     public void SetPlaybackSpeed(float speed)
     {
@@ -79,6 +95,16 @@ public sealed class GameManager : MonoBehaviour
             StopCoroutine(playback);
         playback = null;
         paused = false;
+        animalWander?.StopWalking(false);
+    }
+
+    public void ReturnToStart()
+    {
+        StopPlayback();
+        ResetSimulation();
+        agentHud?.SetVisible(false);
+        simulationControls?.SetVisible(false);
+        animalWander?.StopWalking(true);
     }
 
     private void InitializeSimulation()
@@ -96,22 +122,37 @@ public sealed class GameManager : MonoBehaviour
 
         if (simulation["agents"] is not JArray initialAgents)
             return;
+        List<int> agentIds = new();
         foreach (JToken agent in initialAgents)
-            EnsureAgent((int)agent["id"], ReadCell(agent["pos"]));
+        {
+            int id = (int)agent["id"];
+            EnsureAgent(id, ReadCell(agent["pos"]));
+            agentIds.Add(id);
+        }
+        agentHud?.Initialize(agentIds);
     }
 
     private IEnumerator PlaybackRoutine()
     {
         foreach (JToken step in (JArray)simulation["steps"])
         {
+            int activeAgentId = 0;
             foreach (JToken evt in step["events"] as JArray ?? new JArray())
             {
+                int eventAgentId = (int?)evt["agent"] ?? 0;
+                if (eventAgentId != 0 && eventAgentId != activeAgentId)
+                {
+                    activeAgentId = eventAgentId;
+                    agentHud?.SetActiveAgent(activeAgentId);
+                }
                 yield return WaitWhilePaused();
                 yield return PlayEvent(evt);
             }
+            agentHud?.SetActiveAgent(0);
         }
 
         playback = null;
+        animalWander?.StopWalking(false);
     }
 
     private IEnumerator PlayEvent(JToken evt)
@@ -247,11 +288,13 @@ public sealed class GameManager : MonoBehaviour
 
     private void Rescue(int agentId)
     {
-        if (!carriedVictims.Remove(agentId, out GameObject victim))
-            return;
-        DestroyRuntime(victim);
-        if (agents.TryGetValue(agentId, out GameObject agent))
-            agent.GetComponent<AgentAnimation>()?.StopCarrying();
+        if (carriedVictims.Remove(agentId, out GameObject victim))
+        {
+            DestroyRuntime(victim);
+            if (agents.TryGetValue(agentId, out GameObject agent))
+                agent.GetComponent<AgentAnimation>()?.StopCarrying();
+        }
+        agentHud?.AddRescue(agentId);
     }
 
     private void SpawnPointOfInterest(Vector2Int cell)
