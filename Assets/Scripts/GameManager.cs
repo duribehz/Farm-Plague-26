@@ -24,6 +24,8 @@ public sealed class GameManager : MonoBehaviour
     [SerializeField, Min(0f)] private float agentHeight = 0.75f;
     [SerializeField, Min(0f)] private float markerHeight = 0.35f;
     [SerializeField, Min(0.1f)] private float hazardSize = 1.5f;
+    [SerializeField, Min(0.05f)] private float doorAnimationDuration = 0.65f;
+    [SerializeField, Min(0.05f)] private float wallBreakDuration = 0.7f;
 
     private readonly Dictionary<int, GameObject> agents = new();
     private readonly Dictionary<Vector2Int, Transform> tiles = new();
@@ -32,15 +34,43 @@ public sealed class GameManager : MonoBehaviour
     private readonly Dictionary<Vector2Int, GameObject> hazards = new();
     private readonly Dictionary<int, GameObject> carriedVictims = new();
     private readonly List<GameObject> runtimeObjects = new();
+    private readonly List<Material> runtimeParticleMaterials = new();
+    private readonly Dictionary<string, Transform> doors = new();
+    private readonly Dictionary<string, WallState> walls = new();
+    private readonly Dictionary<Transform, Quaternion> initialDoorRotations = new();
 
     private Coroutine playback;
     private JObject simulation;
     private bool paused;
+    private bool collapseReached;
+    private bool victoryReached;
+    private int rescuedTotal;
+
+    private readonly struct WallState
+    {
+        public WallState(Transform transform)
+        {
+            Transform = transform;
+            Position = transform.localPosition;
+            Rotation = transform.localRotation;
+            Scale = transform.localScale;
+            Active = transform.gameObject.activeSelf;
+        }
+
+        public Transform Transform { get; }
+        public Vector3 Position { get; }
+        public Quaternion Rotation { get; }
+        public Vector3 Scale { get; }
+        public bool Active { get; }
+    }
 
     private void Start()
     {
         CacheTiles();
+        CacheBoardGeometry();
         agentHud?.SetVisible(false);
+        agentHud?.SetStatsVisible(false);
+        agentHud?.HideEndScreen();
         simulationControls?.SetVisible(false);
     }
 
@@ -103,12 +133,18 @@ public sealed class GameManager : MonoBehaviour
         StopPlayback();
         ResetSimulation();
         agentHud?.SetVisible(false);
+        agentHud?.SetStatsVisible(false);
+        agentHud?.HideEndScreen();
         simulationControls?.SetVisible(false);
         animalWander?.StopWalking(true);
     }
 
     private void InitializeSimulation()
     {
+        collapseReached = false;
+        victoryReached = false;
+        rescuedTotal = 0;
+        agentHud?.HideEndScreen();
         if (simulation["map"]?["cells"] is JArray rows)
         {
             for (int y = 0; y < rows.Count; y++)
@@ -147,10 +183,15 @@ public sealed class GameManager : MonoBehaviour
                 }
                 yield return WaitWhilePaused();
                 yield return PlayEvent(evt);
+                if (collapseReached || victoryReached)
+                    break;
             }
             agentHud?.SetActiveAgent(0);
+            if (collapseReached || victoryReached)
+                break;
         }
 
+        ApplyResultStats();
         playback = null;
         animalWander?.StopWalking(false);
     }
@@ -159,6 +200,8 @@ public sealed class GameManager : MonoBehaviour
     {
         string type = (string)evt["type"];
         int agentId = (int?)evt["agent"] ?? 0;
+        if (agentId != 0 && evt["ap_remaining"] != null)
+            agentHud?.SetActionPoints(agentId, (int)evt["ap_remaining"]);
 
         switch (type)
         {
@@ -168,6 +211,8 @@ public sealed class GameManager : MonoBehaviour
                     yield return MoveAgent(agent, TilePosition(tile, agentHeight));
                 yield break;
             case "cell_change":
+                if ((string)evt["from"] == "fire" && (string)evt["to"] == "none")
+                    yield break;
                 ApplyCellChange(ReadCell(evt["pos"]), (string)evt["to"]);
                 break;
             case "pickup":
@@ -175,10 +220,18 @@ public sealed class GameManager : MonoBehaviour
                 break;
             case "rescue":
                 Rescue(agentId);
+                rescuedTotal = (int?)evt["total"] ?? rescuedTotal + 1;
+                if (rescuedTotal >= 7)
+                {
+                    victoryReached = true;
+                    agentHud?.ShowEndScreen(
+                        true, rescuedTotal, agentHud?.KilledVictims ?? 0, agentHud?.StructuralDamage ?? 0);
+                    yield break;
+                }
                 break;
             case "extinguish":
-                RemoveFrom(hazards, ReadCell(evt["pos"]));
-                break;
+                yield return ExtinguishFire(agentId, ReadCell(evt["pos"]));
+                yield break;
             case "fire_spread":
                 if (evt["cells"] is JArray spreadCells)
                     foreach (JToken target in spreadCells)
@@ -187,11 +240,24 @@ public sealed class GameManager : MonoBehaviour
             case "kill":
                 RemoveFrom(occupants, ReadCell(evt["pos"]));
                 RemoveFrom(pointsOfInterest, ReadCell(evt["pos"]));
+                agentHud?.AddKilledVictim();
                 break;
             case "door_open":
+                yield return OpenDoor(ReadCell(evt["from"]), ReadCell(evt["to"]));
+                yield break;
             case "wall_chop":
-                // The board geometry is static; these events retain their place in playback timing.
+                yield return BreakWall(agentId, ReadCell(evt["from"]), ReadCell(evt["to"]));
+                yield break;
+            case "structural_damage":
+                if (evt["total"] != null)
+                    agentHud?.SetStructuralDamage((int)evt["total"]);
+                else
+                    agentHud?.AddStructuralDamage((int?)evt["amount"] ?? 1);
                 break;
+            case "collapse":
+                agentHud?.SetStructuralDamage((int?)evt["total"] ?? 24);
+                collapseReached = true;
+                yield break;
             default:
                 Debug.LogWarning($"GameManager: unsupported event '{type}'.", this);
                 break;
@@ -218,6 +284,259 @@ public sealed class GameManager : MonoBehaviour
         }
         agent.transform.position = destination;
         agentAnimation?.EndMove();
+    }
+
+    private IEnumerator OpenDoor(Vector2Int from, Vector2Int to)
+    {
+        string key = EdgeKey(from, to);
+        if (!doors.TryGetValue(key, out Transform leaf))
+        {
+            Debug.LogWarning($"GameManager: door {key} was not found.", this);
+            yield break;
+        }
+
+        foreach (MonoBehaviour behaviour in leaf.GetComponents<MonoBehaviour>())
+            if (behaviour.GetType().FullName == "DoorScript.Door")
+                behaviour.enabled = false;
+
+        Quaternion start = leaf.localRotation;
+        Quaternion target = Quaternion.Euler(0f, -90f, 0f);
+        float elapsed = 0f;
+        while (elapsed < doorAnimationDuration)
+        {
+            yield return WaitWhilePaused();
+            elapsed += Time.deltaTime * playbackSpeed;
+            leaf.localRotation = Quaternion.Slerp(start, target,
+                Mathf.SmoothStep(0f, 1f, elapsed / doorAnimationDuration));
+            yield return null;
+        }
+        leaf.localRotation = target;
+    }
+
+    private IEnumerator BreakWall(int agentId, Vector2Int from, Vector2Int to)
+    {
+        string wallName = WallName(from, to);
+        if (wallName == null || !walls.TryGetValue(wallName, out WallState state))
+        {
+            Debug.LogWarning($"GameManager: wall between {from} and {to} was not found.", this);
+            yield break;
+        }
+
+        Transform wall = state.Transform;
+        AgentAnimation agentAnimation = agents.TryGetValue(agentId, out GameObject agent)
+            ? agent.GetComponent<AgentAnimation>()
+            : null;
+        agentAnimation?.BeginChop(wall.position);
+        ParticleSystem dust = CreateWallDust(wall);
+        SpawnWallFragments(wall);
+        Vector3 startPosition = wall.localPosition;
+        Quaternion startRotation = wall.localRotation;
+        Vector3 startScale = wall.localScale;
+        float elapsed = 0f;
+        while (elapsed < wallBreakDuration)
+        {
+            yield return WaitWhilePaused();
+            elapsed += Time.deltaTime * playbackSpeed;
+            float progress = Mathf.Clamp01(elapsed / wallBreakDuration);
+            agentAnimation?.AnimateChop(progress);
+            float shake = Mathf.Sin(progress * Mathf.PI * 10f) * (1f - progress) * 0.08f;
+            wall.localPosition = startPosition + Vector3.up * (-startScale.y * 0.45f * progress) +
+                Vector3.right * shake;
+            wall.localRotation = startRotation * Quaternion.Euler(0f, 0f, 12f * progress);
+            wall.localScale = Vector3.Scale(startScale,
+                new Vector3(1f - progress * 0.15f, 1f - progress, 1f));
+            yield return null;
+        }
+        agentAnimation?.EndChop();
+        StopAndReleaseEffect(dust, 1.5f);
+        wall.gameObject.SetActive(false);
+    }
+
+    private IEnumerator ExtinguishFire(int agentId, Vector2Int cell)
+    {
+        if (!TryGetTile(cell, out Transform tile))
+            yield break;
+
+        GameObject agent = agents.TryGetValue(agentId, out GameObject foundAgent) ? foundAgent : null;
+        Vector3 target = tile.position + Vector3.up * 0.55f;
+        AgentAnimation agentAnimation = agent != null ? agent.GetComponent<AgentAnimation>() : null;
+        agentAnimation?.BeginExtinguish(target);
+
+        Vector3 origin = agent != null
+            ? agent.transform.position + Vector3.up * 1.05f + agent.transform.forward * 0.3f
+            : target + Vector3.up;
+        ParticleSystem water = CreateWaterStream(origin, target);
+        ParticleSystem impact = CreateWaterImpact(target);
+        hazards.TryGetValue(cell, out GameObject fire);
+        Vector3 fireScale = fire != null ? fire.transform.localScale : Vector3.one;
+
+        const float duration = 1f;
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            yield return WaitWhilePaused();
+            elapsed += Time.deltaTime * playbackSpeed;
+            float progress = Mathf.Clamp01(elapsed / duration);
+            agentAnimation?.AnimateExtinguish(progress);
+            if (fire != null)
+                fire.transform.localScale = fireScale * Mathf.Lerp(1f, 0.08f, progress);
+            yield return null;
+        }
+
+        agentAnimation?.EndExtinguish();
+        StopAndReleaseEffect(water, 0.75f);
+        StopAndReleaseEffect(impact, 0.75f);
+        RemoveFrom(hazards, cell);
+    }
+
+    private ParticleSystem CreateWaterStream(Vector3 origin, Vector3 target)
+    {
+        GameObject effect = new("ExtinguishWaterStream");
+        effect.transform.SetParent(transform, true);
+        effect.transform.SetPositionAndRotation(origin, Quaternion.LookRotation(target - origin));
+        runtimeObjects.Add(effect);
+        ParticleSystem water = effect.AddComponent<ParticleSystem>();
+
+        ParticleSystem.MainModule main = water.main;
+        main.loop = true;
+        main.startLifetime = Vector3.Distance(origin, target) / 7f;
+        main.startSpeed = new ParticleSystem.MinMaxCurve(6.5f, 7.5f);
+        main.startSize = new ParticleSystem.MinMaxCurve(0.045f, 0.1f);
+        main.startColor = new ParticleSystem.MinMaxGradient(
+            new Color(0.08f, 0.45f, 1f, 0.9f),
+            new Color(0.25f, 0.85f, 1f, 0.95f));
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 120;
+
+        ParticleSystem.EmissionModule emission = water.emission;
+        emission.rateOverTime = 100f;
+        ParticleSystem.ShapeModule shape = water.shape;
+        shape.shapeType = ParticleSystemShapeType.Cone;
+        shape.angle = 3f;
+        shape.radius = 0.025f;
+        ConfigureParticleMaterial(effect, new Color(0.12f, 0.55f, 1f));
+        water.Play();
+        return water;
+    }
+
+    private ParticleSystem CreateWaterImpact(Vector3 target)
+    {
+        GameObject effect = new("ExtinguishWaterImpact");
+        effect.transform.SetParent(transform, true);
+        effect.transform.position = target;
+        runtimeObjects.Add(effect);
+        ParticleSystem impact = effect.AddComponent<ParticleSystem>();
+
+        ParticleSystem.MainModule main = impact.main;
+        main.loop = true;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(0.25f, 0.55f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(0.4f, 1.4f);
+        main.startSize = new ParticleSystem.MinMaxCurve(0.05f, 0.16f);
+        main.startColor = new ParticleSystem.MinMaxGradient(
+            new Color(0.2f, 0.7f, 1f, 0.8f),
+            new Color(0.75f, 0.9f, 1f, 0.5f));
+        main.gravityModifier = 0.25f;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 80;
+
+        ParticleSystem.EmissionModule emission = impact.emission;
+        emission.rateOverTime = 55f;
+        ParticleSystem.ShapeModule shape = impact.shape;
+        shape.shapeType = ParticleSystemShapeType.Hemisphere;
+        shape.radius = 0.25f;
+        ConfigureParticleMaterial(effect, new Color(0.45f, 0.8f, 1f));
+        impact.Play();
+        return impact;
+    }
+
+    private void ConfigureParticleMaterial(GameObject effect, Color color)
+    {
+        Shader shader = Shader.Find("Particles/Standard Unlit");
+        if (shader == null)
+            return;
+        Material material = new(shader) { color = color };
+        effect.GetComponent<ParticleSystemRenderer>().material = material;
+        runtimeParticleMaterials.Add(material);
+    }
+
+    private ParticleSystem CreateWallDust(Transform wall)
+    {
+        GameObject effect = new($"{wall.name}_Dust");
+        effect.transform.SetParent(transform, true);
+        runtimeObjects.Add(effect);
+        Renderer wallRenderer = wall.GetComponent<Renderer>();
+        Bounds bounds = wallRenderer != null ? wallRenderer.bounds : new Bounds(wall.position, Vector3.one);
+        effect.transform.position = bounds.center;
+
+        ParticleSystem dust = effect.AddComponent<ParticleSystem>();
+        dust.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+        ParticleSystem.MainModule main = dust.main;
+        main.loop = false;
+        main.duration = wallBreakDuration;
+        main.startLifetime = new ParticleSystem.MinMaxCurve(0.6f, 1.4f);
+        main.startSpeed = new ParticleSystem.MinMaxCurve(0.25f, 1.1f);
+        main.startSize = new ParticleSystem.MinMaxCurve(0.08f, 0.24f);
+        main.startColor = new ParticleSystem.MinMaxGradient(
+            new Color(0.3f, 0.22f, 0.14f, 0.75f),
+            new Color(0.65f, 0.58f, 0.48f, 0.6f));
+        main.gravityModifier = 0.15f;
+        main.maxParticles = 90;
+
+        ParticleSystem.EmissionModule emission = dust.emission;
+        emission.rateOverTime = 70f;
+        ParticleSystem.ShapeModule shape = dust.shape;
+        shape.shapeType = ParticleSystemShapeType.Box;
+        shape.scale = bounds.size * 0.75f;
+
+        ParticleSystemRenderer particleRenderer = effect.GetComponent<ParticleSystemRenderer>();
+        Shader shader = Shader.Find("Particles/Standard Unlit");
+        if (shader != null)
+        {
+            Material material = new(shader);
+            particleRenderer.material = material;
+            runtimeParticleMaterials.Add(material);
+        }
+        dust.Play();
+        return dust;
+    }
+
+    private void StopAndReleaseEffect(ParticleSystem particles, float delay)
+    {
+        if (particles == null)
+            return;
+
+        GameObject effect = particles.gameObject;
+        ParticleSystemRenderer renderer = effect.GetComponent<ParticleSystemRenderer>();
+        Material material = renderer != null ? renderer.sharedMaterial : null;
+        particles.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+        runtimeObjects.Remove(effect);
+        if (material != null && runtimeParticleMaterials.Remove(material))
+            Destroy(material, delay);
+        Destroy(effect, delay);
+    }
+
+    private void SpawnWallFragments(Transform wall)
+    {
+        Renderer wallRenderer = wall.GetComponent<Renderer>();
+        Bounds bounds = wallRenderer != null ? wallRenderer.bounds : new Bounds(wall.position, Vector3.one);
+        for (int i = 0; i < 7; i++)
+        {
+            GameObject fragment = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            fragment.name = $"{wall.name}_Fragment_{i}";
+            fragment.transform.SetParent(transform, true);
+            fragment.transform.position = bounds.center + new Vector3(
+                UnityEngine.Random.Range(-bounds.extents.x, bounds.extents.x),
+                UnityEngine.Random.Range(-bounds.extents.y * 0.5f, bounds.extents.y),
+                UnityEngine.Random.Range(-bounds.extents.z, bounds.extents.z));
+            fragment.transform.localScale = Vector3.one * UnityEngine.Random.Range(0.08f, 0.2f);
+            if (wallRenderer != null && fragment.TryGetComponent(out Renderer fragmentRenderer))
+                fragmentRenderer.sharedMaterial = wallRenderer.sharedMaterial;
+            Rigidbody body = fragment.AddComponent<Rigidbody>();
+            body.mass = 0.15f;
+            body.AddForce((Vector3.up + UnityEngine.Random.insideUnitSphere) * 1.5f, ForceMode.Impulse);
+            body.AddTorque(UnityEngine.Random.insideUnitSphere * 4f, ForceMode.Impulse);
+            Destroy(fragment, 2.5f);
+        }
     }
 
     private GameObject EnsureAgent(int id, Vector2Int position)
@@ -322,7 +641,17 @@ public sealed class GameManager : MonoBehaviour
         if (instance == null)
             return;
         if (prefab != null)
+        {
             FitHazardToTile(instance, tile);
+            try
+            {
+                instance.AddComponent<HazardAnimation>().Configure(state == "fire");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"GameManager: could not configure {instance.name}. {exception.Message}", instance);
+            }
+        }
         hazards[cell] = instance;
     }
 
@@ -388,6 +717,65 @@ public sealed class GameManager : MonoBehaviour
         }
     }
 
+    private void CacheBoardGeometry()
+    {
+        doors.Clear();
+        walls.Clear();
+        initialDoorRotations.Clear();
+
+        foreach (Transform candidate in FindObjectsByType<Transform>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (candidate.name.StartsWith("Wall_", StringComparison.Ordinal))
+            {
+                walls[candidate.name] = new WallState(candidate);
+                continue;
+            }
+            if (!candidate.name.StartsWith("Door_Interior_", StringComparison.Ordinal))
+                continue;
+
+            string endpoints = candidate.name.Substring("Door_Interior_".Length);
+            string[] cells = endpoints.Split(new[] { "__" }, StringSplitOptions.None);
+            if (cells.Length != 2 || !TryParseNamedCell(cells[0], out Vector2Int a) ||
+                !TryParseNamedCell(cells[1], out Vector2Int b))
+                continue;
+
+            Transform leaf = candidate.Find("Door");
+            if (leaf == null)
+                continue;
+            doors[EdgeKey(a, b)] = leaf;
+            initialDoorRotations[leaf] = leaf.localRotation;
+        }
+    }
+
+    private static bool TryParseNamedCell(string value, out Vector2Int cell)
+    {
+        string[] coordinates = value.Split('_');
+        if (coordinates.Length == 2 && int.TryParse(coordinates[0], out int x) &&
+            int.TryParse(coordinates[1], out int y))
+        {
+            cell = new Vector2Int(x, y);
+            return true;
+        }
+        cell = default;
+        return false;
+    }
+
+    private static string EdgeKey(Vector2Int a, Vector2Int b)
+    {
+        if (a.x > b.x || a.x == b.x && a.y > b.y)
+            (a, b) = (b, a);
+        return $"{a.x}_{a.y}__{b.x}_{b.y}";
+    }
+
+    private static string WallName(Vector2Int a, Vector2Int b)
+    {
+        if (a.y == b.y && Mathf.Abs(a.x - b.x) == 1)
+            return $"Wall_V_F{a.y}_C{Mathf.Max(a.x, b.x)}";
+        if (a.x == b.x && Mathf.Abs(a.y - b.y) == 1)
+            return $"Wall_H_F{Mathf.Max(a.y, b.y)}_C{a.x}";
+        return null;
+    }
+
     private bool TryGetTile(Vector2Int cell, out Transform tile)
     {
         if (tiles.TryGetValue(cell, out tile))
@@ -432,15 +820,59 @@ public sealed class GameManager : MonoBehaviour
 
     private void ResetSimulation()
     {
+        collapseReached = false;
+        victoryReached = false;
+        rescuedTotal = 0;
+        agentHud?.SetStructuralDamage(0);
+        agentHud?.SetKilledVictims(0);
         foreach (GameObject instance in runtimeObjects)
             if (instance != null)
                 Destroy(instance);
         runtimeObjects.Clear();
+        foreach (Material material in runtimeParticleMaterials)
+            if (material != null)
+                Destroy(material);
+        runtimeParticleMaterials.Clear();
         agents.Clear();
         pointsOfInterest.Clear();
         occupants.Clear();
         hazards.Clear();
         carriedVictims.Clear();
+
+        foreach (KeyValuePair<Transform, Quaternion> door in initialDoorRotations)
+            if (door.Key != null)
+                door.Key.localRotation = door.Value;
+        foreach (WallState wall in walls.Values)
+        {
+            if (wall.Transform == null)
+                continue;
+            wall.Transform.localPosition = wall.Position;
+            wall.Transform.localRotation = wall.Rotation;
+            wall.Transform.localScale = wall.Scale;
+            wall.Transform.gameObject.SetActive(wall.Active);
+        }
+    }
+
+    private void ApplyResultStats()
+    {
+        JToken result = simulation?["result"];
+        int rescued = (int?)result?["rescued"] ?? rescuedTotal;
+        int killed = (int?)result?["killed"] ?? agentHud?.KilledVictims ?? 0;
+        int damage = (int?)result?["structural_damage"] ?? agentHud?.StructuralDamage ?? 0;
+        agentHud?.SetStructuralDamage(damage);
+        agentHud?.SetKilledVictims(killed);
+
+        string endReason = ((string)result?["end_reason"])?.Trim();
+        if (string.Equals(endReason, "max steps reached", StringComparison.OrdinalIgnoreCase))
+        {
+            agentHud?.HideEndScreen();
+            return;
+        }
+
+        if (string.Equals(endReason, "7 victims rescued", StringComparison.OrdinalIgnoreCase) || rescued >= 7)
+            agentHud?.ShowEndScreen(true, rescued, killed, damage);
+        else if (killed >= 4 || damage >= 24 || collapseReached)
+            agentHud?.ShowEndScreen(false, rescued, killed, damage);
     }
 
     private IEnumerator WaitSeconds(float seconds)

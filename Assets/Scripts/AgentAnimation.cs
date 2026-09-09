@@ -88,6 +88,58 @@ public sealed class AgentAnimation : MonoBehaviour
             ResetArms();
     }
 
+    public void BeginChop(Vector3 target)
+    {
+        Vector3 direction = target - transform.position;
+        direction.y = 0f;
+        if (direction.sqrMagnitude > 0.0001f)
+            transform.rotation = Quaternion.LookRotation(direction.normalized, Vector3.up) *
+                Quaternion.Euler(0f, modelForwardOffset, 0f);
+    }
+
+    public void AnimateChop(float progress)
+    {
+        float strike = Mathf.Sin(progress * Mathf.PI * 6f);
+        float angle = Mathf.Lerp(-95f, 35f, (strike + 1f) * 0.5f);
+        SetLocalXRotation(rightArm, rightArmRest, angle);
+        if (!carrying)
+            SetLocalXRotation(leftArm, leftArmRest, -20f - strike * 12f);
+    }
+
+    public void EndChop()
+    {
+        if (carrying)
+            SetCarryingArms();
+        else
+            ResetArms();
+    }
+
+    public void BeginExtinguish(Vector3 target)
+    {
+        Vector3 direction = target - transform.position;
+        direction.y = 0f;
+        if (direction.sqrMagnitude > 0.0001f)
+            transform.rotation = Quaternion.LookRotation(direction.normalized, Vector3.up) *
+                Quaternion.Euler(0f, modelForwardOffset, 0f);
+        SetLocalXRotation(leftArm, leftArmRest, -72f);
+        SetLocalXRotation(rightArm, rightArmRest, -72f);
+    }
+
+    public void AnimateExtinguish(float progress)
+    {
+        float recoil = Mathf.Sin(progress * Mathf.PI * 8f) * 4f;
+        SetLocalXRotation(leftArm, leftArmRest, -72f + recoil);
+        SetLocalXRotation(rightArm, rightArmRest, -72f - recoil);
+    }
+
+    public void EndExtinguish()
+    {
+        if (carrying)
+            SetCarryingArms();
+        else
+            ResetArms();
+    }
+
     public void AttachVictim(GameObject victim)
     {
         carrying = true;

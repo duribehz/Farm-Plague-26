@@ -7,9 +7,11 @@ public sealed class SimulationControls : MonoBehaviour
 {
     [SerializeField] private GameManager gameManager;
     [SerializeField] private WebClient webClient;
-    [SerializeField] private Sprite buttonBackground;
+    [SerializeField] private Sprite pauseButtonBackground;
+    [SerializeField] private Sprite pauseIcon;
+    [SerializeField] private Sprite restartButtonBackground;
+    [SerializeField] private Sprite restartIcon;
     [SerializeField] private TMP_FontAsset font;
-    [SerializeField] private Color buttonColor = new(0.93f, 0.04f, 0.08f, 1f);
 
     private Button pauseButton;
     private Button restartButton;
@@ -67,8 +69,8 @@ public sealed class SimulationControls : MonoBehaviour
         root.anchorMax = new Vector2(1f, 1f);
         root.pivot = new Vector2(1f, 1f);
         root.anchoredPosition = new Vector2(-16f, -16f);
-        root.sizeDelta = new Vector2(270f, 48f);
-        root.localScale = Vector3.one * 1.5f;
+        root.sizeDelta = new Vector2(350f, 68f);
+        root.localScale = Vector3.one;
 
         HorizontalLayoutGroup layout = GetOrAdd<HorizontalLayoutGroup>(gameObject);
         layout.spacing = 10f;
@@ -78,34 +80,34 @@ public sealed class SimulationControls : MonoBehaviour
         layout.childForceExpandWidth = false;
         layout.childForceExpandHeight = false;
 
-        pauseButton = ConfigureButton(GetChild("PauseButton"), "PAUSA", out pauseText);
-        restartButton = ConfigureButton(GetChild("RestartButton"), "RESTART", out _);
+        pauseButton = ConfigureButton(GetChild("PauseButton"), "PAUSA", pauseButtonBackground, pauseIcon, out pauseText);
+        restartButton = ConfigureButton(GetChild("RestartButton"), "REINICIAR", restartButtonBackground, restartIcon, out _);
     }
 
-    private Button ConfigureButton(GameObject target, string label, out TMP_Text labelText)
+    private Button ConfigureButton(GameObject target, string label, Sprite background, Sprite icon, out TMP_Text labelText)
     {
         RectTransform rect = target.GetComponent<RectTransform>();
-        rect.sizeDelta = new Vector2(130f, 48f);
+        rect.sizeDelta = new Vector2(170f, 64f);
 
         Image image = GetOrAdd<Image>(target);
-        image.sprite = buttonBackground;
-        image.type = Image.Type.Sliced;
-        image.color = buttonColor;
+        image.sprite = background;
+        image.type = Image.Type.Simple;
+        image.color = Color.white;
 
         Button button = GetOrAdd<Button>(target);
         button.targetGraphic = image;
         ColorBlock colors = button.colors;
         colors.normalColor = Color.white;
-        colors.highlightedColor = new Color(0.8f, 0.8f, 0.8f, 1f);
-        colors.pressedColor = new Color(0.65f, 0.65f, 0.65f, 1f);
+        colors.highlightedColor = new Color(1.08f, 1.08f, 1.08f, 1f);
+        colors.pressedColor = new Color(0.78f, 0.78f, 0.78f, 1f);
         button.colors = colors;
 
         GameObject textObject = GetChild(target.transform, "Label");
         RectTransform textRect = textObject.GetComponent<RectTransform>();
         textRect.anchorMin = Vector2.zero;
         textRect.anchorMax = Vector2.one;
-        textRect.offsetMin = Vector2.zero;
-        textRect.offsetMax = Vector2.zero;
+        textRect.offsetMin = new Vector2(icon != null ? 43f : 8f, 7f);
+        textRect.offsetMax = new Vector2(-8f, -4f);
 
         TextMeshProUGUI text = GetOrAdd<TextMeshProUGUI>(textObject);
         text.text = label;
@@ -115,8 +117,26 @@ public sealed class SimulationControls : MonoBehaviour
         text.color = Color.white;
         text.alignment = TextAlignmentOptions.Center;
         text.raycastTarget = false;
+        ConfigureButtonIcon(target.transform, icon);
         labelText = text;
         return button;
+    }
+
+    private static void ConfigureButtonIcon(Transform parent, Sprite sprite)
+    {
+        GameObject iconObject = GetChild(parent, "Icon");
+        RectTransform rect = iconObject.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(0f, 0.5f);
+        rect.anchorMax = new Vector2(0f, 0.5f);
+        rect.pivot = new Vector2(0f, 0.5f);
+        rect.anchoredPosition = new Vector2(16f, 2f);
+        rect.sizeDelta = new Vector2(28f, 28f);
+        Image image = GetOrAdd<Image>(iconObject);
+        image.sprite = sprite;
+        image.color = Color.white;
+        image.preserveAspect = true;
+        image.raycastTarget = false;
+        iconObject.SetActive(sprite != null);
     }
 
     private GameObject GetChild(string childName) => GetChild(transform, childName);
