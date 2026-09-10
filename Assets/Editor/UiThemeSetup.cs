@@ -9,23 +9,27 @@ internal static class UiThemeSetup
 {
     private const string ScenePath = "Assets/Scenes/Demo.unity";
     private const string BlueButton = "Assets/UI/PNG/Blue/Double/button_square_gloss.png";
+    private const string GreyButton = "Assets/UI/PNG/Grey/Double/button_square_gloss.png";
+    private const string OrangeButton = "Assets/UI/PNG/Yellow/Double/button_square_gloss.png";
     private const string YellowButton = "Assets/UI/PNG/Yellow/Double/button_rectangle_depth_gradient.png";
     private const string GreenButton = "Assets/UI/PNG/Green/Double/button_rectangle_depth_gradient.png";
     private const string RedButton = "Assets/UI/PNG/Red/Double/button_rectangle_depth_gradient.png";
     private const string PlayIcon = "Assets/UI/PNG/Extra/Double/icon_play_light.png";
     private const string PauseIcon = "Assets/UI/PNG/Yellow/Double/check_round_grey_circle.png";
     private const string RepeatIcon = "Assets/UI/PNG/Extra/Double/icon_repeat_light.png";
+    private const string FirePrefab = "Assets/Prefabs/Virus/Virus2_Fire.prefab";
+    private const string SmokePrefab = "Assets/Prefabs/Virus/Virus1_Smoke.prefab";
 
     [MenuItem("Tools/Farm Plague/Apply Kenney UI Theme")]
     private static void ApplyTheme()
     {
-        string[] textures = { BlueButton, YellowButton, GreenButton, RedButton, PlayIcon, PauseIcon, RepeatIcon };
+        string[] textures = { BlueButton, GreyButton, OrangeButton, YellowButton, GreenButton, RedButton, PlayIcon, PauseIcon, RepeatIcon };
         bool changedImporter = false;
         foreach (string path in textures)
         {
             if (AssetImporter.GetAtPath(path) is not TextureImporter importer)
                 continue;
-            bool needsBorder = path == BlueButton;
+            bool needsBorder = path == BlueButton || path == GreyButton || path == OrangeButton;
             Vector4 border = needsBorder ? new Vector4(20f, 20f, 20f, 20f) : Vector4.zero;
             if (importer.textureType == TextureImporterType.Sprite &&
                 !importer.mipmapEnabled && importer.spriteBorder == border)
@@ -54,17 +58,25 @@ internal static class UiThemeSetup
             return;
 
         Sprite blue = AssetDatabase.LoadAssetAtPath<Sprite>(BlueButton);
+        Sprite grey = AssetDatabase.LoadAssetAtPath<Sprite>(GreyButton);
+        Sprite orange = AssetDatabase.LoadAssetAtPath<Sprite>(OrangeButton);
         Sprite yellow = AssetDatabase.LoadAssetAtPath<Sprite>(YellowButton);
         Sprite green = AssetDatabase.LoadAssetAtPath<Sprite>(GreenButton);
         Sprite red = AssetDatabase.LoadAssetAtPath<Sprite>(RedButton);
         Sprite play = AssetDatabase.LoadAssetAtPath<Sprite>(PlayIcon);
         Sprite pause = AssetDatabase.LoadAssetAtPath<Sprite>(PauseIcon);
         Sprite repeat = AssetDatabase.LoadAssetAtPath<Sprite>(RepeatIcon);
+        GameObject firePrefab = AssetDatabase.LoadAssetAtPath<GameObject>(FirePrefab);
+        GameObject smokePrefab = AssetDatabase.LoadAssetAtPath<GameObject>(SmokePrefab);
 
         AgentHud hud = Object.FindFirstObjectByType<AgentHud>(FindObjectsInactive.Include);
         SetProperties(hud,
             ("cardBackground", blue),
             ("activeCardBackground", blue),
+            ("infirmaryCardBackground", grey),
+            ("statsCardBackground", orange),
+            ("fireIconPrefab", firePrefab),
+            ("smokeIconPrefab", smokePrefab),
             ("victoryPanelBackground", green),
             ("defeatPanelBackground", red),
             ("endScreenButtonBackground", red),

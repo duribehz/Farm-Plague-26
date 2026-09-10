@@ -26,18 +26,28 @@ public sealed class GameManager : MonoBehaviour
     [SerializeField, Min(0.1f)] private float hazardSize = 1.5f;
     [SerializeField, Min(0.05f)] private float doorAnimationDuration = 0.65f;
     [SerializeField, Min(0.05f)] private float wallBreakDuration = 0.7f;
+    [SerializeField, Min(0.5f)] private float infirmaryFlightHeight = 5f;
+    [SerializeField, Min(0.1f)] private float infirmaryGardenClearance = 0.5f;
+    [SerializeField, Min(0.25f)] private float infirmaryAgentSpacing = 0.75f;
 
     private readonly Dictionary<int, GameObject> agents = new();
     private readonly Dictionary<Vector2Int, Transform> tiles = new();
     private readonly Dictionary<Vector2Int, GameObject> pointsOfInterest = new();
     private readonly Dictionary<Vector2Int, GameObject> occupants = new();
     private readonly Dictionary<Vector2Int, GameObject> hazards = new();
+    private readonly Dictionary<Vector2Int, string> hazardStates = new();
     private readonly Dictionary<int, GameObject> carriedVictims = new();
     private readonly List<GameObject> runtimeObjects = new();
     private readonly List<Material> runtimeParticleMaterials = new();
     private readonly Dictionary<string, Transform> doors = new();
     private readonly Dictionary<string, WallState> walls = new();
     private readonly Dictionary<Transform, Quaternion> initialDoorRotations = new();
+    private readonly Dictionary<int, int> infirmarySlots = new();
+
+    private Transform infirmaryAnchor;
+    private Vector3 infirmaryBasePosition;
+    private Vector3 infirmaryRowDirection = Vector3.forward;
+    private Vector3 infirmaryColumnDirection = Vector3.right;
 
     private Coroutine playback;
     private JObject simulation;
@@ -68,6 +78,7 @@ public sealed class GameManager : MonoBehaviour
     {
         CacheTiles();
         CacheBoardGeometry();
+        CacheInfirmary();
         agentHud?.SetVisible(false);
         agentHud?.SetStatsVisible(false);
         agentHud?.HideEndScreen();
@@ -166,6 +177,7 @@ public sealed class GameManager : MonoBehaviour
             agentIds.Add(id);
         }
         agentHud?.Initialize(agentIds);
+        UpdateHazardCounts();
     }
 
     private IEnumerator PlaybackRoutine()
@@ -229,6 +241,20 @@ public sealed class GameManager : MonoBehaviour
                     yield break;
                 }
                 break;
+            case "knockdown":
+                agentHud?.SetAgentInfirmary(agentId, true);
+                DropCarriedVictim(agentId);
+                yield return MoveAgentToInfirmary(agentId, ReadCell(evt["pos"]));
+                yield break;
+            case "ambulance_hold":
+                agentHud?.SetAgentInfirmary(agentId, true);
+                if (!infirmarySlots.ContainsKey(agentId))
+                    yield return MoveAgentToInfirmary(agentId, ReadCell(evt["pos"]));
+                yield break;
+            case "respawn":
+                agentHud?.SetAgentInfirmary(agentId, false);
+                yield return RespawnAgent(agentId, ReadCell(evt["spawn"] ?? evt["pos"]));
+                yield break;
             case "extinguish":
                 yield return ExtinguishFire(agentId, ReadCell(evt["pos"]));
                 yield break;
@@ -247,6 +273,12 @@ public sealed class GameManager : MonoBehaviour
                 yield break;
             case "wall_chop":
                 yield return BreakWall(agentId, ReadCell(evt["from"]), ReadCell(evt["to"]));
+                yield break;
+            case "wall_damaged":
+                yield return DamageWall(evt["edge"], (int?)evt["hp"] ?? 1);
+                yield break;
+            case "wall_destroyed":
+                yield return DestroyWall(evt["edge"]);
                 yield break;
             case "structural_damage":
                 if (evt["total"] != null)
@@ -284,6 +316,72 @@ public sealed class GameManager : MonoBehaviour
         }
         agent.transform.position = destination;
         agentAnimation?.EndMove();
+    }
+
+    private IEnumerator FlyAgent(GameObject agent, Vector3 destination)
+    {
+        Vector3 start = agent.transform.position;
+        AgentAnimation agentAnimation = agent.GetComponent<AgentAnimation>();
+        agentAnimation?.BeginMove(destination - start);
+        float duration = moveDuration * 1.35f;
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            yield return WaitWhilePaused();
+            float scaledDeltaTime = Time.deltaTime * playbackSpeed;
+            elapsed += scaledDeltaTime;
+            float progress = Mathf.Clamp01(elapsed / duration);
+            float easedProgress = Mathf.SmoothStep(0f, 1f, progress);
+            Vector3 position = Vector3.Lerp(start, destination, easedProgress);
+            position.y += Mathf.Sin(progress * Mathf.PI) * infirmaryFlightHeight;
+            agent.transform.position = position;
+            agentAnimation?.AnimateMove(progress, scaledDeltaTime);
+            yield return null;
+        }
+        agent.transform.position = destination;
+        agentAnimation?.EndMove();
+    }
+
+    private IEnumerator MoveAgentToInfirmary(int agentId, Vector2Int lastCell)
+    {
+        GameObject agent = EnsureAgent(agentId, lastCell);
+        if (agent == null)
+            yield break;
+        if (infirmaryAnchor == null)
+        {
+            Debug.LogWarning("GameManager: Vegetable garden was not found; infirmary movement was skipped.", this);
+            yield break;
+        }
+
+        if (!infirmarySlots.TryGetValue(agentId, out int slot))
+        {
+            slot = Mathf.Max(0, agentId - 1) % 6;
+            infirmarySlots[agentId] = slot;
+        }
+        int row = slot / 3;
+        int column = slot % 3 - 1;
+        Vector3 destination = infirmaryBasePosition +
+            infirmaryColumnDirection * (column * infirmaryAgentSpacing) +
+            infirmaryRowDirection * (row * infirmaryAgentSpacing);
+        yield return FlyAgent(agent, destination);
+    }
+
+    private IEnumerator RespawnAgent(int agentId, Vector2Int spawn)
+    {
+        infirmarySlots.Remove(agentId);
+        if (!agents.TryGetValue(agentId, out GameObject agent))
+            agent = EnsureAgent(agentId, spawn);
+        if (agent == null || !TryGetTile(spawn, out Transform tile))
+            yield break;
+        yield return FlyAgent(agent, TilePosition(tile, agentHeight));
+    }
+
+    private void DropCarriedVictim(int agentId)
+    {
+        if (carriedVictims.Remove(agentId, out GameObject victim))
+            DestroyRuntime(victim);
+        if (agents.TryGetValue(agentId, out GameObject agent))
+            agent.GetComponent<AgentAnimation>()?.StopCarrying();
     }
 
     private IEnumerator OpenDoor(Vector2Int from, Vector2Int to)
@@ -327,6 +425,44 @@ public sealed class GameManager : MonoBehaviour
             ? agent.GetComponent<AgentAnimation>()
             : null;
         agentAnimation?.BeginChop(wall.position);
+        yield return AnimateWallDestruction(wall, agentAnimation);
+    }
+
+    private IEnumerator DamageWall(JToken edge, int hp)
+    {
+        if (!TryGetWall(edge, out Transform wall) || !wall.gameObject.activeSelf)
+            yield break;
+
+        ParticleSystem dust = CreateWallDust(wall);
+        Vector3 startPosition = wall.localPosition;
+        Quaternion startRotation = wall.localRotation;
+        const float duration = 0.38f;
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            yield return WaitWhilePaused();
+            elapsed += Time.deltaTime * playbackSpeed;
+            float progress = Mathf.Clamp01(elapsed / duration);
+            float shake = Mathf.Sin(progress * Mathf.PI * 12f) * (1f - progress) * 0.1f;
+            wall.localPosition = startPosition + Vector3.right * shake;
+            wall.localRotation = startRotation * Quaternion.Euler(0f, 0f, Mathf.Sin(progress * Mathf.PI) * 6f);
+            yield return null;
+        }
+        wall.localPosition = startPosition;
+        wall.localRotation = startRotation * Quaternion.Euler(0f, 0f, hp <= 1 ? 4f : 2f);
+        AddWallCracks(wall);
+        StopAndReleaseEffect(dust, 1.5f);
+    }
+
+    private IEnumerator DestroyWall(JToken edge)
+    {
+        if (!TryGetWall(edge, out Transform wall) || !wall.gameObject.activeSelf)
+            yield break;
+        yield return AnimateWallDestruction(wall, null);
+    }
+
+    private IEnumerator AnimateWallDestruction(Transform wall, AgentAnimation agentAnimation)
+    {
         ParticleSystem dust = CreateWallDust(wall);
         SpawnWallFragments(wall);
         Vector3 startPosition = wall.localPosition;
@@ -338,18 +474,59 @@ public sealed class GameManager : MonoBehaviour
             yield return WaitWhilePaused();
             elapsed += Time.deltaTime * playbackSpeed;
             float progress = Mathf.Clamp01(elapsed / wallBreakDuration);
+            float easedProgress = Mathf.SmoothStep(0f, 1f, progress);
             agentAnimation?.AnimateChop(progress);
-            float shake = Mathf.Sin(progress * Mathf.PI * 10f) * (1f - progress) * 0.08f;
-            wall.localPosition = startPosition + Vector3.up * (-startScale.y * 0.45f * progress) +
+            float shake = Mathf.Sin(progress * Mathf.PI * 12f) * (1f - progress) * 0.12f;
+            wall.localPosition = startPosition + Vector3.down * (startScale.y * 0.42f * easedProgress) +
                 Vector3.right * shake;
-            wall.localRotation = startRotation * Quaternion.Euler(0f, 0f, 12f * progress);
-            wall.localScale = Vector3.Scale(startScale,
-                new Vector3(1f - progress * 0.15f, 1f - progress, 1f));
+            wall.localRotation = startRotation * Quaternion.Euler(82f * easedProgress, 0f, 5f * easedProgress);
+            wall.localScale = Vector3.Scale(startScale, new Vector3(1f, 1f - 0.08f * easedProgress, 1f));
             yield return null;
         }
         agentAnimation?.EndChop();
         StopAndReleaseEffect(dust, 1.5f);
         wall.gameObject.SetActive(false);
+    }
+
+    private bool TryGetWall(JToken edge, out Transform wall)
+    {
+        wall = null;
+        if (edge is not JArray cells || cells.Count < 2)
+            return false;
+        string wallName = WallName(ReadCell(cells[0]), ReadCell(cells[1]));
+        return wallName != null && walls.TryGetValue(wallName, out WallState state) &&
+            (wall = state.Transform) != null;
+    }
+
+    private void AddWallCracks(Transform wall)
+    {
+        if (wall.Find("DamageCrack_0") != null)
+            return;
+
+        Shader shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null)
+            shader = Shader.Find("Standard");
+        Material crackMaterial = shader != null
+            ? new Material(shader) { color = new Color(0.12f, 0.08f, 0.05f) }
+            : null;
+        if (crackMaterial != null)
+            runtimeParticleMaterials.Add(crackMaterial);
+
+        for (int i = 0; i < 3; i++)
+        {
+            GameObject crack = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            crack.name = $"DamageCrack_{i}";
+            crack.transform.SetParent(wall, false);
+            crack.transform.localPosition = new Vector3((i - 1) * 0.12f, (i - 1) * 0.14f, -0.54f);
+            crack.transform.localRotation = Quaternion.Euler(0f, 0f, i % 2 == 0 ? 32f : -32f);
+            crack.transform.localScale = new Vector3(0.025f, 0.24f, 0.025f);
+            Collider crackCollider = crack.GetComponent<Collider>();
+            if (crackCollider != null)
+                Destroy(crackCollider);
+            if (crackMaterial != null)
+                crack.GetComponent<Renderer>().sharedMaterial = crackMaterial;
+            runtimeObjects.Add(crack);
+        }
     }
 
     private IEnumerator ExtinguishFire(int agentId, Vector2Int cell)
@@ -387,6 +564,8 @@ public sealed class GameManager : MonoBehaviour
         StopAndReleaseEffect(water, 0.75f);
         StopAndReleaseEffect(impact, 0.75f);
         RemoveFrom(hazards, cell);
+        hazardStates.Remove(cell);
+        UpdateHazardCounts();
     }
 
     private ParticleSystem CreateWaterStream(Vector3 origin, Vector3 target)
@@ -571,6 +750,8 @@ public sealed class GameManager : MonoBehaviour
         }
 
         RemoveFrom(hazards, cell);
+        hazardStates.Remove(cell);
+        UpdateHazardCounts();
         if (state == "unknown")
         {
             SpawnPointOfInterest(cell);
@@ -631,15 +812,22 @@ public sealed class GameManager : MonoBehaviour
             return;
 
         RemoveFrom(hazards, cell);
+        hazardStates.Remove(cell);
         if (state == "none" || state == "exit")
+        {
+            UpdateHazardCounts();
             return;
+        }
 
         GameObject prefab = state == "fire" ? firePrefab : smokePrefab;
         GameObject instance = prefab != null
             ? Create(prefab, TilePosition(tile, markerHeight), $"{state}_{cell.x}_{cell.y}")
             : CreateFallbackHazard(tile, state, cell);
         if (instance == null)
+        {
+            UpdateHazardCounts();
             return;
+        }
         if (prefab != null)
         {
             FitHazardToTile(instance, tile);
@@ -653,6 +841,23 @@ public sealed class GameManager : MonoBehaviour
             }
         }
         hazards[cell] = instance;
+        hazardStates[cell] = state;
+        UpdateHazardCounts();
+    }
+
+    private void UpdateHazardCounts()
+    {
+        int fireCount = 0;
+        int smokeCount = 0;
+        foreach (string state in hazardStates.Values)
+        {
+            if (state == "fire")
+                fireCount++;
+            else if (state == "smoke")
+                smokeCount++;
+        }
+        agentHud?.SetFireCount(fireCount);
+        agentHud?.SetSmokeCount(smokeCount);
     }
 
     private void FitHazardToTile(GameObject instance, Transform tile)
@@ -747,6 +952,41 @@ public sealed class GameManager : MonoBehaviour
         }
     }
 
+    private void CacheInfirmary()
+    {
+        infirmaryAnchor = null;
+        foreach (Transform candidate in FindObjectsByType<Transform>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (candidate.name == "Vegetable garden")
+            {
+                infirmaryAnchor = candidate;
+                break;
+            }
+        }
+        if (infirmaryAnchor == null)
+            return;
+
+        Renderer[] renderers = infirmaryAnchor.GetComponentsInChildren<Renderer>(true);
+        Bounds bounds = renderers.Length > 0
+            ? renderers[0].bounds
+            : new Bounds(infirmaryAnchor.position, Vector3.one * 2f);
+        for (int i = 1; i < renderers.Length; i++)
+            bounds.Encapsulate(renderers[i].bounds);
+
+        Vector3 boardCenter = Vector3.zero;
+        foreach (Transform tile in tiles.Values)
+            boardCenter += tile.position;
+        if (tiles.Count > 0)
+            boardCenter /= tiles.Count;
+        infirmaryRowDirection = Vector3.ProjectOnPlane(bounds.center - boardCenter, Vector3.up).normalized;
+        if (infirmaryRowDirection.sqrMagnitude < 0.01f)
+            infirmaryRowDirection = Vector3.forward;
+        infirmaryColumnDirection = Vector3.Cross(Vector3.up, infirmaryRowDirection).normalized;
+        Vector3 gardenEdge = bounds.ClosestPoint(bounds.center + infirmaryRowDirection * 1000f);
+        infirmaryBasePosition = gardenEdge + infirmaryRowDirection * infirmaryGardenClearance;
+        infirmaryBasePosition.y = bounds.min.y + agentHeight;
+    }
+
     private static bool TryParseNamedCell(string value, out Vector2Int cell)
     {
         string[] coordinates = value.Split('_');
@@ -825,6 +1065,8 @@ public sealed class GameManager : MonoBehaviour
         rescuedTotal = 0;
         agentHud?.SetStructuralDamage(0);
         agentHud?.SetKilledVictims(0);
+        agentHud?.SetFireCount(0);
+        agentHud?.SetSmokeCount(0);
         foreach (GameObject instance in runtimeObjects)
             if (instance != null)
                 Destroy(instance);
@@ -837,7 +1079,9 @@ public sealed class GameManager : MonoBehaviour
         pointsOfInterest.Clear();
         occupants.Clear();
         hazards.Clear();
+        hazardStates.Clear();
         carriedVictims.Clear();
+        infirmarySlots.Clear();
 
         foreach (KeyValuePair<Transform, Quaternion> door in initialDoorRotations)
             if (door.Key != null)
@@ -863,15 +1107,21 @@ public sealed class GameManager : MonoBehaviour
         agentHud?.SetKilledVictims(killed);
 
         string endReason = ((string)result?["end_reason"])?.Trim();
+        bool victory = victoryReached || rescued >= 7 ||
+            string.Equals(endReason, "7 victims rescued", StringComparison.OrdinalIgnoreCase);
+        if (victory)
+        {
+            agentHud?.ShowEndScreen(true, Mathf.Max(rescued, rescuedTotal), killed, damage);
+            return;
+        }
+
         if (string.Equals(endReason, "max steps reached", StringComparison.OrdinalIgnoreCase))
         {
             agentHud?.HideEndScreen();
             return;
         }
 
-        if (string.Equals(endReason, "7 victims rescued", StringComparison.OrdinalIgnoreCase) || rescued >= 7)
-            agentHud?.ShowEndScreen(true, rescued, killed, damage);
-        else if (killed >= 4 || damage >= 24 || collapseReached)
+        if (killed >= 4 || damage >= 24 || collapseReached)
             agentHud?.ShowEndScreen(false, rescued, killed, damage);
     }
 
